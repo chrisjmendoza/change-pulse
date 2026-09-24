@@ -1,0 +1,53 @@
+{
+  "name": "change-pulse",
+  "displayName": "Change Pulse",
+  "description": "Highlights recent edits in the editor, Explorer, and Source Control with live +/− line change counters.",
+  "version": "0.1.0",
+  "publisher": "your-publisher",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-user/change-pulse.git"
+  },
+  "homepage": "https://github.com/your-user/change-pulse#readme",
+  "bugs": {
+    "url": "https://github.com/your-user/change-pulse/issues"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "file-change-flash.clearChanges",
+        "title": "Clear Recent File Change Highlights",
+        "category": "Change Pulse"
+      },
+      {
+        "command": "file-change-flash.showSummary",
+        "title": "Show Change Summary",
+        "category": "Change Pulse"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "tsc -p ./ --noEmit",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.12",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.2.2",
+    "typescript": "^5.5.4"
+  }
+}
