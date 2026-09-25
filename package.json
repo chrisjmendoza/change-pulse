@@ -3,15 +3,16 @@
   "displayName": "Change Pulse",
   "description": "Highlights recent edits in the editor, Explorer, and Source Control with live +/− line change counters.",
   "version": "0.1.0",
-  "publisher": "your-publisher",
+  "publisher": "plusorminustwo-designs",
+  "icon": "images/change-pulse-icon.png",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-user/change-pulse.git"
+    "url": "https://github.com/chrisjmendoza/change-pulse.git"
   },
-  "homepage": "https://github.com/your-user/change-pulse#readme",
+  "homepage": "https://github.com/chrisjmendoza/change-pulse#readme",
   "bugs": {
-    "url": "https://github.com/your-user/change-pulse/issues"
+    "url": "https://github.com/chrisjmendoza/change-pulse/issues"
   },
   "engines": {
     "vscode": "^1.90.0"
@@ -24,10 +25,35 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "views": {
+      "scm": [
+        {
+          "id": "changePulse.activity",
+          "name": "Change Pulse",
+          "visibility": "visible"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "changePulse.activity",
+        "contents": "Recent file activity appears here, including agent edits to unopened files.\nCounters show net lines added and removed since tracking started or was cleared."
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "file-change-flash.clearChanges",
+          "when": "view == changePulse.activity",
+          "group": "navigation"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "file-change-flash.clearChanges",
-        "title": "Clear Recent File Change Highlights",
+        "title": "Clear Activity and Reset Counters",
+        "icon": "$(clear-all)",
         "category": "Change Pulse"
       },
       {
@@ -42,12 +68,18 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "tsc -p ./ --noEmit",
+    "test": "npm run compile && node --test tests/*.test.cjs",
+    "test:host": "npm run compile && node scripts/run-host-tests.cjs",
     "package": "vsce package"
   },
   "devDependencies": {
     "@types/node": "^20.14.12",
-    "@types/vscode": "^1.90.0",
+    "@types/vscode": "1.90.0",
+    "@vscode/test-electron": "2.5.2",
     "@vscode/vsce": "^3.2.2",
     "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "diff": "8.0.4"
   }
 }
