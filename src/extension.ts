@@ -1,309 +1,256 @@
 import * as vscode from 'vscode';
+import { Activity, ActivityModel } from './activity';
 
-interface ChangeSummary {
-  added: number;
-  removed: number;
-  changedLines: number[];
-  updatedAt: number;
-}
+const EXCLUDE = '**/{.git,node_modules,.venv,venv,.vscode-test,.next,dist,build,out,coverage}/**';
+const IGNORED = /(?:^|\/)(?:\.git|node_modules|\.venv|venv|\.vscode-test|\.next|dist|build|out|coverage)(?:\/|$)/;
+const MAX_FILE_BYTES = 1024 * 1024;
 
-export function activate(context: vscode.ExtensionContext): void {
-  const tracker = new FileChangeTracker();
+/** Track session activity, including files never opened in an editor. */
+export function activate(context: vscode.ExtensionContext): ChangePulse {
+  const tracker = new ChangePulse();
   context.subscriptions.push(tracker);
+  return tracker;
 }
 
-export function deactivate(): void {
-  // no-op
-}
-
-class FileChangeTracker implements vscode.Disposable {
-  private readonly changes = new Map<string, ChangeSummary>();
-  private readonly documentSnapshots = new Map<string, string>();
-  private readonly flashDecoration = vscode.window.createTextEditorDecorationType({
-    backgroundColor: new vscode.ThemeColor('editor.findRangeHighlightBackground'),
-    border: '1px solid rgba(250, 204, 21, 0.9)',
-    borderRadius: '3px',
-    overviewRulerColor: new vscode.ThemeColor('editorOverviewRuler.addedForeground'),
-    overviewRulerLane: vscode.OverviewRulerLane.Right,
-    light: {
-      backgroundColor: 'rgba(255, 240, 138, 0.65)'
-    },
-    dark: {
-      backgroundColor: 'rgba(255, 186, 73, 0.24)'
-    }
-  });
-
-  private readonly sourceControl = vscode.scm.createSourceControl('file-change-tracker', 'File Change Tracker');
-  private readonly recentChangesGroup = this.sourceControl.createResourceGroup('recent-file-changes', 'Recent changes');
-  private readonly fileDecorationProvider = new ActiveFileDecorationProvider(this.changes);
+/** Activity view alongside Git in Source Control, plus transient file decorations. */
+export class ChangePulse implements vscode.Disposable, vscode.TreeDataProvider<Activity>, vscode.FileDecorationProvider {
+  readonly model = new ActivityModel();
+  private readonly treeEvents = new vscode.EventEmitter<Activity | undefined>();
+  private readonly decorationEvents = new vscode.EventEmitter<vscode.Uri | undefined>();
+  readonly onDidChangeTreeData = this.treeEvents.event;
+  readonly onDidChangeFileDecorations = this.decorationEvents.event;
   private readonly disposables: vscode.Disposable[] = [];
+  private readonly pending = new Map<string, boolean>();
+  private readonly excluded = new Set<string>();
+  private readonly token = new vscode.CancellationTokenSource();
+  private readonly decoration = vscode.window.createTextEditorDecorationType({
+    isWholeLine: true, backgroundColor: new vscode.ThemeColor('editor.findRangeHighlightBackground'),
+    overviewRulerColor: new vscode.ThemeColor('editorOverviewRuler.modifiedForeground'),
+    overviewRulerLane: vscode.OverviewRulerLane.Right
+  });
+  private readonly view: vscode.TreeView<Activity>;
+  private timer: ReturnType<typeof setInterval>;
+  private stopped = false;
+  private initializing = true;
+  private draining = false;
+  private phase = false;
+  private previouslyActive = false;
+  private limited = false;
+  private readErrors = false;
+  private inFlight: Promise<void> | undefined;
+  /** Resolves when initial baselines and queued startup changes have been processed. */
+  readonly ready: Promise<void>;
 
   constructor() {
-    this.sourceControl.count = 0;
-    this.recentChangesGroup.hideWhenEmpty = true;
-    this.sourceControl.acceptInputCommand = {
-      command: 'file-change-flash.clearChanges',
-      title: 'Clear recent changes'
-    };
-
-    this.disposables.push(
-      vscode.window.registerFileDecorationProvider(this.fileDecorationProvider),
-      vscode.workspace.onDidOpenTextDocument((document) => this.trackSnapshot(document)),
-      vscode.workspace.onDidChangeTextDocument((event) => this.handleDocumentChange(event.document)),
-      vscode.commands.registerCommand('file-change-flash.clearChanges', () => this.clearAll()),
-      vscode.commands.registerCommand('file-change-flash.showSummary', () => this.showSummary())
+    this.view = vscode.window.createTreeView('changePulse.activity', { treeDataProvider: this, showCollapseAll: false });
+    this.view.message = 'Preparing file baselines…';
+    const watcher = vscode.workspace.createFileSystemWatcher('**/*');
+    this.disposables.push(this.view, watcher, this.treeEvents, this.decorationEvents, this.decoration, this.token,
+      vscode.window.registerFileDecorationProvider(this),
+      watcher.onDidCreate(uri => this.queue(uri, true)),
+      watcher.onDidChange(uri => this.queue(uri)),
+      watcher.onDidDelete(uri => this.queue(uri)),
+      vscode.workspace.onDidChangeTextDocument(event => {
+        if (event.contentChanges.length) { this.documentChanged(event.document); }
+      }),
+      vscode.workspace.onDidOpenTextDocument(document => this.documentOpened(document)),
+      vscode.workspace.onDidCloseTextDocument(document => this.queue(document.uri)),
+      vscode.workspace.onDidChangeWorkspaceFolders(() => { void this.reconcileFolders(); }),
+      vscode.window.onDidChangeVisibleTextEditors(() => this.renderEditors()),
+      vscode.commands.registerCommand('file-change-flash.clearChanges', async () => {
+        await this.ready; await this.flush();
+        if (this.stopped) { return; }
+        this.model.clear(); this.refresh();
+      }),
+      vscode.commands.registerCommand('file-change-flash.showSummary', () => vscode.commands.executeCommand('changePulse.activity.focus'))
     );
-
-    for (const document of vscode.workspace.textDocuments) {
-      this.trackSnapshot(document);
-    }
-
-    this.refreshSourceControl();
+    this.timer = setInterval(() => {
+      if (this.initializing || this.stopped) { return; }
+      void this.flush();
+      const active = [...this.model.entries.values()].some(entry => entry.activeUntil > Date.now());
+      if (active || this.previouslyActive) { this.phase = !this.phase; this.refresh(); }
+      this.previouslyActive = active;
+    }, 350);
+    this.ready = this.initialize();
   }
 
-  public dispose(): void {
-    for (const disposable of this.disposables) {
-      disposable.dispose();
-    }
-    this.flashDecoration.dispose();
+  private eligible(uri: vscode.Uri): boolean {
+    const folder = vscode.workspace.getWorkspaceFolder(uri);
+    return !!folder && !IGNORED.test(uri.path.slice(folder.uri.path.length)) && !this.excluded.has(uri.toString());
   }
 
-  private trackSnapshot(document: vscode.TextDocument): void {
-    if (document.uri.scheme !== 'file') {
-      return;
+  private queue(uri: vscode.Uri, created = false): void {
+    if (this.stopped || !this.eligible(uri)) { return; }
+    const key = uri.toString();
+    this.pending.set(key, created || this.pending.get(key) || false);
+    // Folder delete/rename notifications need not include individual child events.
+    for (const tracked of this.model.entries.keys()) {
+      if (tracked.startsWith(key.replace(/\/$/, '') + '/')) { this.pending.set(tracked, false); }
     }
-
-    this.documentSnapshots.set(document.uri.fsPath, document.getText());
   }
 
-  private handleDocumentChange(document: vscode.TextDocument): void {
-    if (document.uri.scheme !== 'file') {
-      return;
-    }
-
-    const path = document.uri.fsPath;
-    const previousText = this.documentSnapshots.get(path) ?? document.getText();
-    const diff = this.computeDiff(previousText, document.getText());
-
-    this.documentSnapshots.set(path, document.getText());
-
-    if (diff.changedLines.length === 0 && diff.added === 0 && diff.removed === 0) {
-      return;
-    }
-
-    const existing = this.changes.get(path) ?? {
-      added: 0,
-      removed: 0,
-      changedLines: [],
-      updatedAt: 0
-    };
-
-    const next: ChangeSummary = {
-      added: existing.added + diff.added,
-      removed: existing.removed + diff.removed,
-      changedLines: diff.changedLines,
-      updatedAt: Date.now()
-    };
-
-    this.changes.set(path, next);
-    this.refreshSourceControl();
-    this.refreshEditorHighlight(document, diff.changedLines);
-    this.fileDecorationProvider.refresh(vscode.Uri.file(path));
-
-    setTimeout(() => {
-      this.clearFlashForFile(path);
-    }, 2200);
+  private async initialize(): Promise<void> {
+    try { await this.seedWorkspace(); } catch { this.readErrors = true; }
+    if (this.stopped) { return; }
+    this.initializing = false;
+    await this.flush(); this.refresh();
   }
 
-  private refreshEditorHighlight(document: vscode.TextDocument, changedLines: number[]): void {
-    const editorRanges = this.buildRangesForLines(document, changedLines);
-    for (const editor of vscode.window.visibleTextEditors) {
-      if (editor.document.uri.fsPath === document.uri.fsPath) {
-        editor.setDecorations(this.flashDecoration, editorRanges);
+  private async seedWorkspace(): Promise<void> {
+    for (const document of vscode.workspace.textDocuments) { this.documentOpened(document); }
+    const uris = await vscode.workspace.findFiles('**/*', EXCLUDE, this.model.maxFiles + 1, this.token.token);
+    if (uris.length > this.model.maxFiles) { this.limited = true; }
+    let index = 0;
+    await Promise.all(Array.from({ length: 4 }, async () => {
+      while (index < Math.min(uris.length, this.model.maxFiles) && !this.stopped) {
+        const uri = uris[index++]; const key = uri.toString();
+        if (!this.eligible(uri) || this.model.entries.has(key) || this.pending.has(key)) { continue; }
+        const text = await this.readText(uri);
+        if (this.stopped || !this.eligible(uri) || this.pending.has(key)) { continue; }
+        if (text !== undefined) { this.accept(key, this.model.seed(key, text)); }
       }
-    }
+    }));
+    for (const document of vscode.workspace.textDocuments) { this.documentOpened(document); }
   }
 
-  private clearFlashForFile(path: string): void {
-    for (const editor of vscode.window.visibleTextEditors) {
-      if (editor.document.uri.fsPath === path) {
-        editor.setDecorations(this.flashDecoration, []);
-      }
-    }
+  private documentOpened(document: vscode.TextDocument): void {
+    if (this.stopped || !this.eligible(document.uri) || this.model.entries.has(document.uri.toString())) { return; }
+    const text = document.getText();
+    if (Buffer.byteLength(text) > MAX_FILE_BYTES) { this.skip(document.uri.toString()); return; }
+    if (this.pending.has(document.uri.toString())) { return; }
+    this.accept(document.uri.toString(), this.model.seed(document.uri.toString(), text));
   }
 
-  private buildRangesForLines(document: vscode.TextDocument, changedLines: number[]): vscode.Range[] {
-    const normalized = Array.from(new Set(changedLines)).sort((left, right) => left - right);
-    if (normalized.length === 0) {
-      return [];
-    }
-
-    const ranges: vscode.Range[] = [];
-    let runStart = normalized[0];
-    let runEnd = normalized[0];
-
-    for (let index = 1; index < normalized.length; index += 1) {
-      const current = normalized[index];
-      if (current === runEnd + 1) {
-        runEnd = current;
-        continue;
-      }
-
-      ranges.push(this.rangeForLineRun(document, runStart, runEnd));
-      runStart = current;
-      runEnd = current;
-    }
-
-    ranges.push(this.rangeForLineRun(document, runStart, runEnd));
-    return ranges;
+  private documentChanged(document: vscode.TextDocument): void {
+    if (this.stopped || !this.eligible(document.uri)) { return; }
+    if (this.initializing) { this.queue(document.uri); return; }
+    const key = document.uri.toString(); const text = document.getText();
+    if (Buffer.byteLength(text) > MAX_FILE_BYTES) { this.skip(key); this.refresh(); return; }
+    this.accept(key, this.model.update(key, text, true, this.pending.get(key) ?? false, Date.now()));
+    this.refresh();
   }
 
-  private rangeForLineRun(document: vscode.TextDocument, start: number, end: number): vscode.Range {
-    const safeStartLine = Math.max(0, start);
-    const safeEndLine = Math.min(document.lineCount - 1, end);
-    const startPosition = new vscode.Position(safeStartLine, 0);
-    const endLineText = document.lineAt(safeEndLine).text;
-    const endPosition = new vscode.Position(safeEndLine, endLineText.length);
-
-    return new vscode.Range(startPosition, endPosition);
-  }
-
-  private computeDiff(previousText: string, nextText: string): { added: number; removed: number; changedLines: number[] } {
-    const previousLines = previousText.split(/\r?\n/);
-    const nextLines = nextText.split(/\r?\n/);
-
-    let start = 0;
-    while (
-      start < previousLines.length &&
-      start < nextLines.length &&
-      previousLines[start] === nextLines[start]
-    ) {
-      start += 1;
-    }
-
-    let previousEnd = previousLines.length - 1;
-    let nextEnd = nextLines.length - 1;
-    while (
-      previousEnd >= start &&
-      nextEnd >= start &&
-      previousLines[previousEnd] === nextLines[nextEnd]
-    ) {
-      previousEnd -= 1;
-      nextEnd -= 1;
-    }
-
-    const removed = Math.max(0, previousEnd - start + 1);
-    const added = Math.max(0, nextEnd - start + 1);
-
-    if (removed === 0 && added === 0) {
-      return { added: 0, removed: 0, changedLines: [] };
-    }
-
-    const changedLines: number[] = [];
-    for (let index = start; index <= nextEnd; index += 1) {
-      if (index >= 0 && index < nextLines.length) {
-        changedLines.push(index);
-      }
-    }
-
-    return {
-      added,
-      removed,
-      changedLines
-    };
-  }
-
-  private refreshSourceControl(): void {
-    const resourceStates = Array.from(this.changes.entries())
-      .sort((left, right) => right[1].updatedAt - left[1].updatedAt)
-      .slice(0, 50)
-      .map(([path, summary]) => ({
-        resourceUri: vscode.Uri.file(path),
-        command: {
-          command: 'vscode.open',
-          title: 'Open file',
-          arguments: [vscode.Uri.file(path)]
-        },
-        contextValue: 'file-change-tracker-resource',
-        decorations: {
-          tooltip: `Recent changes: +${summary.added} / -${summary.removed} (${this.formatDelta(summary)})`
-        }
-      } as vscode.SourceControlResourceState));
-
-    this.recentChangesGroup.resourceStates = resourceStates;
-    this.sourceControl.count = resourceStates.length;
-  }
-
-  private formatDelta(summary: ChangeSummary): string {
-    const added = summary.added > 0 ? `+${summary.added}` : '';
-    const removed = summary.removed > 0 ? `-${summary.removed}` : '';
-
-    if (added && removed) {
-      return `${added}/${removed}`;
-    }
-
-    return added || removed || '•';
-  }
-
-  private clearAll(): void {
-    this.changes.clear();
-    this.refreshSourceControl();
-    for (const editor of vscode.window.visibleTextEditors) {
-      editor.setDecorations(this.flashDecoration, []);
-    }
-  }
-
-  private showSummary(): void {
-    const entries = Array.from(this.changes.entries())
-      .sort((left, right) => right[1].updatedAt - left[1].updatedAt)
-      .map(([path, summary]) => `${path}: +${summary.added} / -${summary.removed}`)
-      .join('\n');
-
-    if (!entries) {
-      vscode.window.showInformationMessage('No recent file changes are currently tracked.');
-      return;
-    }
-
-    vscode.window.showInformationMessage(entries, { modal: false });
-  }
-}
-
-class ActiveFileDecorationProvider implements vscode.FileDecorationProvider {
-  private readonly changes: Map<string, ChangeSummary>;
-  private readonly emitter = new vscode.EventEmitter<vscode.Uri | undefined>();
-
-  public readonly onDidChangeFileDecorations = this.emitter.event;
-
-  constructor(changes: Map<string, ChangeSummary>) {
-    this.changes = changes;
-  }
-
-  public refresh(uri?: vscode.Uri): void {
-    this.emitter.fire(uri);
-  }
-
-  public provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
-    const summary = this.changes.get(uri.fsPath);
-    if (!summary) {
+  private async readText(uri: vscode.Uri): Promise<string | undefined> {
+    try {
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (stat.type & vscode.FileType.Directory) { return undefined; }
+      if (stat.size > MAX_FILE_BYTES) { this.skip(uri.toString()); return undefined; }
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      if (bytes.length > MAX_FILE_BYTES || bytes.includes(0)) { this.skip(uri.toString()); return undefined; }
+      try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+      catch { this.skip(uri.toString()); return undefined; }
+    } catch (error) {
+      if ((error as { code?: string }).code !== 'FileNotFound') { this.readErrors = true; }
       return undefined;
     }
-
-    const badge = this.formatBadge(summary);
-    return {
-      badge,
-      color: new vscode.ThemeColor('gitDecoration.modifiedResourceForeground'),
-      tooltip: `Recent file changes: +${summary.added} / -${summary.removed}`
-    };
   }
 
-  private formatBadge(summary: ChangeSummary): string {
-    const added = summary.added > 0 ? `+${summary.added}` : '';
-    const removed = summary.removed > 0 ? `-${summary.removed}` : '';
+  /** Coalesce duplicate save events and serialize batches with bounded parallel I/O. */
+  async flush(): Promise<void> {
+    if (this.draining) { await this.inFlight; if (this.pending.size) { await this.flush(); } return; }
+    if (this.initializing || this.stopped || !this.pending.size) { return; }
+    this.draining = true;
+    this.inFlight = (async () => {
+      const batch = [...this.pending]; this.pending.clear();
+      let index = 0;
+      await Promise.all(Array.from({ length: 4 }, async () => {
+        while (index < batch.length && !this.stopped) {
+          const [key, created] = batch[index++]; const uri = vscode.Uri.parse(key);
+          if (created) {
+            try {
+              const stat = await vscode.workspace.fs.stat(uri);
+              if (stat.type & vscode.FileType.Directory) {
+                const children = await vscode.workspace.findFiles(new vscode.RelativePattern(uri, '**/*'), EXCLUDE, this.model.maxFiles + 1, this.token.token);
+                if (children.length > this.model.maxFiles) { this.limited = true; }
+                for (const child of children.slice(0, this.model.maxFiles)) { this.queue(child, true); }
+                continue;
+              }
+            } catch { /* The file may have been deleted again; resolve below. */ }
+          }
+          const previous = this.model.entries.get(key);
+          const diskText = await this.readText(uri);
+          if (this.stopped || !this.eligible(uri)) { continue; }
+          if (this.model.entries.get(key) !== previous) { this.queue(uri, created); continue; }
+          const dirty = vscode.workspace.textDocuments.find(doc => doc.uri.toString() === key && doc.isDirty);
+          let text = dirty?.getText() ?? diskText;
+          let exists = true;
+          if (text === undefined) {
+            try { await vscode.workspace.fs.stat(uri); continue; }
+            catch (error) {
+              if ((error as { code?: string }).code !== 'FileNotFound') { this.readErrors = true; continue; }
+              exists = false; text = '';
+            }
+          }
+          if (this.stopped || this.model.entries.get(key) !== previous) { continue; }
+          if (!previous && !exists) { continue; }
+          this.accept(key, this.model.update(key, text, exists, created, Date.now()));
+        }
+      }));
+    })();
+    try { await this.inFlight; } catch { this.readErrors = true; }
+    finally { this.draining = false; this.inFlight = undefined; if (!this.stopped) { this.refresh(); } }
+    if (this.pending.size && !this.stopped) { await this.flush(); }
+  }
 
-    if (added && removed) {
-      return `${added}/${removed}`.slice(0, 4);
+  private accept(key: string, accepted: boolean): void { if (!accepted) { this.skip(key); } }
+  private skip(key: string): void {
+    this.limited = true; this.model.remove(key); this.excluded.add(key);
+  }
+
+  private async reconcileFolders(): Promise<void> {
+    for (const key of this.model.entries.keys()) {
+      if (!this.eligible(vscode.Uri.parse(key))) { this.model.remove(key); }
     }
+    try { await this.seedWorkspace(); } catch { this.readErrors = true; }
+    if (!this.stopped) { this.refresh(); }
+  }
 
-    return (added || removed || '•').slice(0, 4);
+  getChildren(): Activity[] {
+    return [...this.model.entries.values()].filter(entry => entry.touched).sort((a, b) => b.sequence - a.sequence);
+  }
+
+  getTreeItem(entry: Activity): vscode.TreeItem {
+    const uri = vscode.Uri.parse(entry.key);
+    const item = new vscode.TreeItem(uri.path.split('/').pop() || uri.path);
+    item.id = entry.key;
+    const active = entry.activeUntil > Date.now();
+    item.description = `${entry.delta ? `+${entry.delta.added} / −${entry.delta.removed}` : 'counts unavailable'}${active ? ' · active' : ''}${entry.exists ? '' : ' · deleted'} · ${vscode.workspace.asRelativePath(uri)}`;
+    item.tooltip = `${vscode.workspace.asRelativePath(uri)}\nNet line changes since tracking started or was cleared.${entry.baseline === undefined ? '\nNo pre-edit baseline was available; clear tracking to establish one.' : !entry.delta ? '\nDiff exceeded the computation budget.' : ''}`;
+    item.iconPath = new vscode.ThemeIcon(active ? (this.phase ? 'circle-filled' : 'circle-outline') : 'file',
+      active ? new vscode.ThemeColor('charts.yellow') : undefined);
+    if (entry.exists) { item.command = { command: 'vscode.open', title: 'Open file', arguments: [uri] }; }
+    return item;
+  }
+
+  provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
+    const entry = this.model.entries.get(uri.toString());
+    if (!entry?.touched || entry.activeUntil <= Date.now()) { return undefined; }
+    return { badge: this.phase ? '●' : '○', color: new vscode.ThemeColor('charts.yellow'),
+      tooltip: `Change Pulse: active${entry.delta ? ` (+${entry.delta.added} / -${entry.delta.removed})` : ''}` };
+  }
+
+  private refresh(): void {
+    if (this.stopped) { return; }
+    this.view.message = this.initializing ? 'Preparing file baselines…' :
+      `${this.getChildren().length} files changed · net counts since start/clear${this.limited ? ' · some files excluded by size, encoding or tracking limits' : ''}${this.readErrors ? ' · some files could not be read' : ''}`;
+    this.treeEvents.fire(undefined); this.decorationEvents.fire(undefined); this.renderEditors();
+  }
+
+  private renderEditors(): void {
+    if (this.stopped) { return; }
+    for (const editor of vscode.window.visibleTextEditors) {
+      const entry = this.model.entries.get(editor.document.uri.toString());
+      const ranges = entry && entry.activeUntil > Date.now() ? entry.changedLines.map(line => {
+        const safe = Math.max(0, Math.min(line, editor.document.lineCount - 1));
+        return editor.document.lineAt(safe).range;
+      }) : [];
+      editor.setDecorations(this.decoration, ranges);
+    }
+  }
+
+  dispose(): void {
+    this.stopped = true; clearInterval(this.timer); this.token.cancel();
+    this.pending.clear(); this.model.entries.clear(); this.excluded.clear();
+    for (const disposable of this.disposables) { disposable.dispose(); }
   }
 }
